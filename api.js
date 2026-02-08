@@ -186,6 +186,18 @@ const quizSessionSchema = new mongoose.Schema({
     type: String,
     required: false
   },
+
+marks: {  // NEW: marks per question
+  type: Number,
+  default: 1,
+  min: 0
+},
+timeSeconds: {  // NEW: time per question (seconds)
+  type: Number,
+  default: 60,
+  min: 1
+},
+
   options: {
     a: { type: String, required: true },
     b: { type: String, required: true },
@@ -267,6 +279,10 @@ const studentResultSchema = new mongoose.Schema({
     enum: ['A', 'B', 'C', 'D', null]
   }],
   score: {
+    type: Number,
+    required: true
+  },
+  totalMarks: { // NEW: total marks of quiz
     type: Number,
     required: true
   },
@@ -435,6 +451,8 @@ const QuizSession = mongoose.model('QuizSession', quizSessionSchema);
 const StudentResult = mongoose.model('StudentResult', studentResultSchema);
 const QuizViolation = mongoose.model('QuizViolation', quizViolationSchema);
 const User = mongoose.model('User', userSchema);
+
+
 
 // Helper function to generate session ID
 const generateSessionId = () => {
@@ -957,7 +975,7 @@ app.post('/api/auth/google/verify', async (req, res) => {
 app.post('/api/quiz-sessions/:sessionId/questions', async (req, res) => {
   try {
     const sessionId = req.params.sessionId;
-    const { question, options, correct, questionType, imageUrl } = req.body;
+    const { question, options, correct, questionType, imageUrl, marks, timeSeconds } = req.body;
 
     if (!sessionId) {
       return res.status(400).json({ 
@@ -996,7 +1014,19 @@ app.post('/api/quiz-sessions/:sessionId/questions', async (req, res) => {
       });
     }
     
-    const session = await QuizSession.findOne({ 
+    
+
+// Validate marks/timeSeconds (optional)
+const parsedMarks = (marks === undefined || marks === null || marks === '') ? 1 : Number(marks);
+const parsedTimeSeconds = (timeSeconds === undefined || timeSeconds === null || timeSeconds === '') ? 60 : Number(timeSeconds);
+if (Number.isNaN(parsedMarks) || parsedMarks < 0) {
+  return res.status(400).json({ message: 'Marks must be a number >= 0' });
+}
+if (Number.isNaN(parsedTimeSeconds) || parsedTimeSeconds < 1) {
+  return res.status(400).json({ message: 'Time (seconds) must be a number >= 1' });
+}
+
+const session = await QuizSession.findOne({ 
       sessionId: sessionId.toUpperCase() 
     });
     
@@ -1017,6 +1047,8 @@ app.post('/api/quiz-sessions/:sessionId/questions', async (req, res) => {
         c: options.c,
         d: options.d
       },
+      marks: parsedMarks,
+      timeSeconds: parsedTimeSeconds,
       correct: correct.toUpperCase()
     };
     
@@ -1178,6 +1210,11 @@ app.post('/api/quiz-sessions/:sessionId/questions/csv', async (req, res) => {
       }
       if (!['A', 'B', 'C', 'D'].includes(q.correct.toUpperCase())) {
         validationErrors.push(`Row ${index + 2}: Correct answer must be A, B, C, or D`);
+// Optional: marks/timeSeconds
+const mVal = (q.marks === undefined || q.marks === null || q.marks === '') ? 1 : Number(q.marks);
+const tVal = (q.timeSeconds === undefined || q.timeSeconds === null || q.timeSeconds === '') ? 60 : Number(q.timeSeconds);
+if (Number.isNaN(mVal) || mVal < 0) validationErrors.push(`Row ${index + 2}: Marks must be a number >= 0`);
+if (Number.isNaN(tVal) || tVal < 1) validationErrors.push(`Row ${index + 2}: Time (seconds) must be a number >= 1`);
       }
     });
     
@@ -1197,7 +1234,9 @@ app.post('/api/quiz-sessions/:sessionId/questions/csv', async (req, res) => {
         c: q.options.c.trim(),
         d: q.options.d.trim()
       },
-      correct: q.correct.toUpperCase()
+      correct: q.correct.toUpperCase(),
+      marks: (q.marks === undefined || q.marks === null || q.marks === '') ? 1 : Number(q.marks),
+      timeSeconds: (q.timeSeconds === undefined || q.timeSeconds === null || q.timeSeconds === '') ? 60 : Number(q.timeSeconds)
     }));
     
     session.questions.push(...formattedQuestions);
@@ -1306,9 +1345,6 @@ app.post('/api/quiz-results', async (req, res) => {
       department, 
       section,
       answers, 
-      score, 
-      totalQuestions, 
-      percentage,
       isAutoSubmit = false,
       violationType = null,
       isResumed = false,
@@ -1332,7 +1368,21 @@ app.post('/api/quiz-results', async (req, res) => {
       });
     }
     
-    // Check for duplicate submission
+    
+
+// Compute score server-side using per-question marks (prevents tampering)
+const normalizedAnswers = Array.isArray(answers) ? answers : [];
+const questions = session.questions || [];
+const totalQuestions = questions.length;
+const totalMarks = questions.reduce((sum, q) => sum + (Number(q.marks) || 1), 0);
+const score = questions.reduce((sum, q, idx) => {
+  const ans = normalizedAnswers[idx] || null;
+  if (!ans) return sum;
+  return ans === q.correct ? sum + (Number(q.marks) || 1) : sum;
+}, 0);
+const percentage = totalMarks > 0 ? Math.round((score / totalMarks) * 100) : 0;
+
+// Check for duplicate submission
     const existingResult = await StudentResult.findOne({ 
       sessionId: sessionId.toUpperCase(), 
       regNo: regNo.toUpperCase() 
@@ -1350,8 +1400,9 @@ app.post('/api/quiz-results', async (req, res) => {
       regNo: regNo.toUpperCase(),
       department,
       section,
-      answers,
+      answers: normalizedAnswers,
       score,
+      totalMarks,
       totalQuestions,
       percentage,
       isAutoSubmit,
